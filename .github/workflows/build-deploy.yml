@@ -1,0 +1,133 @@
+name: Build & Deploy Suno API
+
+on:
+    push:
+        branches:
+            - main
+    workflow_dispatch:
+
+jobs:
+    build-and-deploy:
+        runs-on: ubuntu-latest
+        env:
+            ECR_REPO: suno-api
+            K8S_NAMESPACE: suno-api
+            K8S_DEPLOYMENT: suno-api
+            K8S_CONTAINER: suno-api
+            AWS_REGION: us-east-2
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Compute image tag
+              run: echo "SLUG=$(echo $GITHUB_SHA | cut -c1-6)" >> $GITHUB_ENV
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  aws-access-key-id: ${{ secrets.AWS_ECR_RW_ACCESS_KEY }}
+                  aws-secret-access-key: ${{ secrets.AWS_ECR_RW_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Create ECR repository (if not exists)
+              run: |
+                  aws ecr describe-repositories --repository-names $ECR_REPO --region $AWS_REGION 2>/dev/null || \
+                  aws ecr create-repository --repository-name $ECR_REPO --region $AWS_REGION
+
+            - name: Login to AWS ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@v2
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Build & push image
+              env:
+                  IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.SLUG }}
+                  LATEST: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
+              run: |
+                  docker buildx build \
+                    --tag $IMAGE \
+                    --tag $LATEST \
+                    --push \
+                    .
+
+            - name: Update kubeconfig
+              run: aws eks update-kubeconfig --name askvera-cluster --region ${{ env.AWS_REGION }}
+
+            - name: Deploy to K8s
+              env:
+                  IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.SLUG }}
+              run: |
+                  kubectl -n $K8S_NAMESPACE apply -f - <<EOF
+                  $(cat <<'MANIFEST'
+                  apiVersion: apps/v1
+                  kind: Deployment
+                  metadata:
+                    name: suno-api
+                    namespace: suno-api
+                  spec:
+                    replicas: 1
+                    selector:
+                      matchLabels:
+                        app: suno-api
+                    template:
+                      metadata:
+                        labels:
+                          app: suno-api
+                      spec:
+                        containers:
+                          - name: suno-api
+                            image: PLACEHOLDER
+                            imagePullPolicy: Always
+                            ports:
+                              - containerPort: 3000
+                            env:
+                              - name: SUNO_COOKIE
+                                valueFrom:
+                                  secretKeyRef:
+                                    name: suno-api-secrets
+                                    key: SUNO_COOKIE
+                              - name: TWOCAPTCHA_KEY
+                                valueFrom:
+                                  secretKeyRef:
+                                    name: suno-api-secrets
+                                    key: TWOCAPTCHA_KEY
+                              - name: BROWSER
+                                value: "chromium"
+                              - name: BROWSER_HEADLESS
+                                value: "true"
+                              - name: BROWSER_GHOST_CURSOR
+                                value: "false"
+                              - name: BROWSER_LOCALE
+                                value: "en"
+                              - name: BROWSER_DISABLE_GPU
+                                value: "true"
+                            resources:
+                              requests:
+                                cpu: 250m
+                                memory: 512Mi
+                              limits:
+                                cpu: "1000m"
+                                memory: 2Gi
+                  MANIFEST
+                  )" | sed "s|image: PLACEHOLDER|image: $IMAGE|"
+                  kubectl -n $K8S_NAMESPACE apply -f - <<EOF
+                  apiVersion: v1
+                  kind: Service
+                  metadata:
+                    name: suno-api
+                    namespace: suno-api
+                  spec:
+                    type: ClusterIP
+                    selector:
+                      app: suno-api
+                    ports:
+                      - protocol: TCP
+                        port: 3000
+                        targetPort: 3000
+                  EOF
+
+            - name: Verify deployment
+              run: kubectl -n $K8S_NAMESPACE rollout status deployment/$K8S_DEPLOYMENT --timeout=5m
